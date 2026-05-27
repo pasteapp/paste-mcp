@@ -2,9 +2,9 @@
 // `@modelcontextprotocol/sdk` `auth()` function. The SDK handles metadata
 // discovery (RFC 9728 protected-resource + RFC 8414 + OIDC fallback),
 // dynamic client registration (RFC 7591), PKCE generation/verification,
-// the `resource` indicator (RFC 8707), `iss` validation (RFC 9207), token
-// exchange, and refresh-token rotation. We provide the storage backing
-// and the side effects (open browser, wait on the loopback callback).
+// the `resource` indicator (RFC 8707), token exchange, and refresh-token
+// rotation. We provide the storage backing and the side effects (open
+// browser, wait on the loopback callback).
 
 import { spawn } from 'node:child_process';
 import {
@@ -12,13 +12,12 @@ import {
   type OAuthClientProvider,
 } from '@modelcontextprotocol/sdk/client/auth.js';
 import type {
-  OAuthClientInformationFull,
   OAuthClientInformationMixed,
   OAuthClientMetadata,
   OAuthTokens,
 } from '@modelcontextprotocol/sdk/shared/auth.js';
 import { startCallbackServer, type CallbackServer } from './callback.js';
-import { TokenStore } from './store.js';
+import { TokenStore, type CachedOAuthState } from './store.js';
 
 const CLIENT_NAME = 'Paste MCP Bridge';
 
@@ -141,7 +140,7 @@ class BridgeProvider implements OAuthClientProvider {
     return (await this.loadCache()).clientInformation;
   }
 
-  async saveClientInformation(info: OAuthClientInformationFull): Promise<void> {
+  async saveClientInformation(info: OAuthClientInformationMixed): Promise<void> {
     await this.mergeCache({ clientInformation: info });
   }
 
@@ -150,7 +149,14 @@ class BridgeProvider implements OAuthClientProvider {
   }
 
   async saveTokens(tokens: OAuthTokens): Promise<void> {
-    await this.mergeCache({ tokens });
+    // The verifier is single-use; once tokens land we don't need it on disk.
+    const cached = await this.loadCache();
+    const next: CachedOAuthState = {
+      serverURL: this.opts.serverURL,
+      tokens,
+      ...(cached.clientInformation ? { clientInformation: cached.clientInformation } : {}),
+    };
+    await this.opts.store.save(next);
   }
 
   async saveCodeVerifier(verifier: string): Promise<void> {
@@ -166,6 +172,10 @@ class BridgeProvider implements OAuthClientProvider {
   }
 
   async redirectToAuthorization(authorizationUrl: URL): Promise<void> {
+    // Enforced here (not just in defaultOpenBrowser) so an injected opener
+    // can't bypass the guard. The AS-supplied `authorization_endpoint` is
+    // attacker-influenceable if the discovered port has been hijacked.
+    assertLoopbackHTTPURL(authorizationUrl.toString());
     await this.opts.openBrowser(authorizationUrl.toString());
   }
 
@@ -184,11 +194,17 @@ class BridgeProvider implements OAuthClientProvider {
     await this.opts.store.save(next);
   }
 
-  private async loadCache() {
-    return (await this.opts.store.load()) ?? { serverURL: this.opts.serverURL };
+  private async loadCache(): Promise<CachedOAuthState> {
+    const stored = await this.opts.store.load();
+    // Cache must belong to the server we were constructed for. A stale entry
+    // for a different server gets dropped here rather than overwritten — the
+    // alternative (always stamping `serverURL: this.opts.serverURL` on save)
+    // would silently graft another server's tokens onto our cache.
+    if (stored && stored.serverURL === this.opts.serverURL) return stored;
+    return { serverURL: this.opts.serverURL };
   }
 
-  private async mergeCache(patch: Partial<Awaited<ReturnType<TokenStore['load']>> & object>): Promise<void> {
+  private async mergeCache(patch: Partial<CachedOAuthState>): Promise<void> {
     const cached = await this.loadCache();
     await this.opts.store.save({ ...cached, ...patch, serverURL: this.opts.serverURL });
   }
@@ -210,7 +226,8 @@ export function assertLoopbackHTTPURL(url: string): URL {
 }
 
 function defaultOpenBrowser(url: string): void {
-  assertLoopbackHTTPURL(url);
+  // URL guard lives in BridgeProvider.redirectToAuthorization so an injected
+  // opener can't bypass it; here we just spawn `/usr/bin/open`.
   const child = spawn('/usr/bin/open', [url], { stdio: 'ignore', detached: true });
   // Without this listener, a missing `/usr/bin/open` (non-macOS) would crash
   // the process with ERR_UNHANDLED_ERROR; here it fails silently and the

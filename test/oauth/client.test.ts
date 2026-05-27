@@ -173,6 +173,32 @@ describe('OAuthClient', () => {
     expect(mock.tokenCalls).toBe(1);
   });
 
+  it('invalidate() clears the cache so the next call re-runs OAuth', async () => {
+    const client = new OAuthClient(new URL(`${mock.url}/mcp`), store, {
+      openBrowser: simulatedBrowser(),
+    });
+    await client.accessToken();
+    expect(mock.registerCalls).toBe(1);
+
+    await client.invalidate();
+    expect(await store.load()).toBeNull();
+
+    mock.setNextCode('mock-code-2');
+    const next = await client.accessToken();
+    expect(next).toBe('tok-for-mock-code-2');
+    expect(mock.registerCalls).toBe(2); // re-registered, not short-circuited
+  });
+
+  it('wipes the PKCE code verifier from disk after the token exchange', async () => {
+    const client = new OAuthClient(new URL(`${mock.url}/mcp`), store, {
+      openBrowser: simulatedBrowser(),
+    });
+    await client.accessToken();
+    const cached = await store.load();
+    expect(cached?.tokens?.access_token).toBeDefined();
+    expect(cached?.codeVerifier).toBeUndefined();
+  });
+
   it('drops a cached state that was issued for a different server URL', async () => {
     const stale: CachedOAuthState = {
       serverURL: 'http://127.0.0.1:99999/mcp',
