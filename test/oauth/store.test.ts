@@ -2,15 +2,14 @@ import { promises as fs } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { TokenStore, type StoredToken } from '../../src/oauth/store.js';
+import { TokenStore, type CachedOAuthState } from '../../src/oauth/store.js';
 
-function makeToken(overrides: Partial<StoredToken> = {}): StoredToken {
+function makeState(overrides: Partial<CachedOAuthState> = {}): CachedOAuthState {
   return {
     serverURL: 'http://127.0.0.1:39725/mcp',
-    clientId: 'cid_abc',
-    accessToken: 'tok_xyz',
-    expiresAt: null,
-    createdAt: '2026-05-26T12:00:00Z',
+    clientInformation: { client_id: 'cid_abc', redirect_uris: ['http://127.0.0.1:0/cb'] },
+    tokens: { access_token: 'tok_xyz', token_type: 'Bearer' },
+    codeVerifier: 'verifier_123',
     ...overrides,
   };
 }
@@ -32,27 +31,26 @@ describe('TokenStore', () => {
     expect(await store.load()).toBeNull();
   });
 
-  it('round-trips a stored token', async () => {
-    const token = makeToken();
-    await store.save(token);
-    expect(await store.load()).toEqual(token);
+  it('round-trips a fully-populated state', async () => {
+    const state = makeState();
+    await store.save(state);
+    expect(await store.load()).toEqual(state);
   });
 
-  it('round-trips a stored token with expiresAt', async () => {
-    const token = makeToken({ expiresAt: '2026-12-31T00:00:00Z' });
-    await store.save(token);
-    const loaded = await store.load();
-    expect(loaded?.expiresAt).toBe('2026-12-31T00:00:00Z');
+  it('round-trips a sparse state (just serverURL + verifier)', async () => {
+    const state = { serverURL: 'http://127.0.0.1:5454/mcp', codeVerifier: 'v' };
+    await store.save(state);
+    expect(await store.load()).toEqual(state);
   });
 
   it('writes the file with mode 0600', async () => {
-    await store.save(makeToken());
+    await store.save(makeState());
     const stat = await fs.stat(store.path);
     expect(stat.mode & 0o777).toBe(0o600);
   });
 
   it('clear() removes the file', async () => {
-    await store.save(makeToken());
+    await store.save(makeState());
     await store.clear();
     expect(await store.load()).toBeNull();
   });
@@ -66,35 +64,20 @@ describe('TokenStore', () => {
     expect(await store.load()).toBeNull();
   });
 
-  it('load() returns null for JSON missing required fields', async () => {
-    await fs.writeFile(store.path, JSON.stringify({ foo: 'bar' }), { mode: 0o600 });
+  it('load() returns null for JSON missing serverURL', async () => {
+    await fs.writeFile(store.path, JSON.stringify({ tokens: { access_token: 't' } }), { mode: 0o600 });
     expect(await store.load()).toBeNull();
   });
 
-  it('load() back-fills missing expiresAt and createdAt for forward-compat', async () => {
-    // A token written by a pre-expiresAt version of the bridge.
-    await fs.writeFile(store.path, JSON.stringify({
-      serverURL: 'http://127.0.0.1:39725/mcp',
-      clientId: 'old',
-      accessToken: 'tok',
-    }), { mode: 0o600 });
-    const loaded = await store.load();
-    expect(loaded?.clientId).toBe('old');
-    expect(loaded?.expiresAt).toBeNull();
-    expect(typeof loaded?.createdAt).toBe('string');
-  });
-
   it('save() is atomic — readers never see a partial file', async () => {
-    const writes = Array.from({ length: 20 }, (_, i) => store.save(makeToken({
-      clientId: `cid-${i}`,
-      accessToken: `tok-${i}`,
+    const writes = Array.from({ length: 20 }, (_, i) => store.save(makeState({
+      tokens: { access_token: `tok-${i}`, token_type: 'Bearer' },
     })));
     const reads = Array.from({ length: 20 }, () => store.load());
     const [, results] = await Promise.all([Promise.all(writes), Promise.all(reads)]);
     for (const r of results) {
       if (r === null) continue;
-      expect(r.clientId).toMatch(/^cid-\d+$/);
-      expect(r.accessToken).toMatch(/^tok-\d+$/);
+      expect(r.tokens?.access_token).toMatch(/^tok-\d+$/);
     }
   });
 });

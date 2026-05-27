@@ -9,9 +9,13 @@
 // stays open. The state is also exposed via `server.state` so the caller can
 // embed it in the `/authorize` request.
 
+import { randomBytes } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { generateState } from './pkce.js';
+
+function generateState(): string {
+  return randomBytes(16).toString('base64url');
+}
 
 export interface CallbackResult {
   code: string | null;

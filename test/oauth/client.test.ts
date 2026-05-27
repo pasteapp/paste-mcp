@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { OAuthClient, assertLoopbackHTTPURL } from '../../src/oauth/client.js';
-import { TokenStore, type StoredToken } from '../../src/oauth/store.js';
+import { TokenStore, type CachedOAuthState } from '../../src/oauth/store.js';
 
 interface MockOAuthServer {
   url: string;
@@ -14,8 +14,13 @@ interface MockOAuthServer {
   lastTokenForm: URLSearchParams | null;
   setNextCode(code: string): void;
   setTokenResponse(body: object): void;
-  setRegisterResponse(body: object): void;
   shutdown(): Promise<void>;
+}
+
+async function readBody(req: import('node:http').IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks).toString('utf8');
 }
 
 async function startMockOAuthServer(): Promise<MockOAuthServer> {
@@ -25,7 +30,6 @@ async function startMockOAuthServer(): Promise<MockOAuthServer> {
     tokenCalls: 0,
     lastTokenForm: null as URLSearchParams | null,
     tokenResponse: null as object | null,
-    registerResponse: null as object | null,
   };
 
   const server = createServer(async (req, res) => {
@@ -45,15 +49,27 @@ async function startMockOAuthServer(): Promise<MockOAuthServer> {
         token_endpoint: `${base}/token`,
         registration_endpoint: `${base}/register`,
         response_types_supported: ['code'],
-        grant_types_supported: ['authorization_code'],
+        grant_types_supported: ['authorization_code', 'refresh_token'],
         code_challenge_methods_supported: ['S256'],
+        token_endpoint_auth_methods_supported: ['none'],
       }));
       return;
     }
     if (req.method === 'POST' && url.pathname === '/register') {
       state.registerCalls += 1;
+      const body = await readBody(req);
+      let parsed: { redirect_uris?: string[]; client_name?: string };
+      try { parsed = JSON.parse(body); } catch { parsed = {}; }
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(state.registerResponse ?? { client_id: `mock-client-${state.registerCalls}` }));
+      res.end(JSON.stringify({
+        client_id: `mock-client-${state.registerCalls}`,
+        client_id_issued_at: Math.floor(Date.now() / 1000),
+        client_name: parsed.client_name ?? 'Test Client',
+        redirect_uris: parsed.redirect_uris ?? [],
+        token_endpoint_auth_method: 'none',
+        grant_types: ['authorization_code', 'refresh_token'],
+        response_types: ['code'],
+      }));
       return;
     }
     if (req.method === 'GET' && url.pathname === '/authorize') {
@@ -68,9 +84,7 @@ async function startMockOAuthServer(): Promise<MockOAuthServer> {
     }
     if (req.method === 'POST' && url.pathname === '/token') {
       state.tokenCalls += 1;
-      const chunks: Buffer[] = [];
-      for await (const chunk of req) chunks.push(chunk as Buffer);
-      state.lastTokenForm = new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
+      state.lastTokenForm = new URLSearchParams(await readBody(req));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(state.tokenResponse ?? {
         access_token: `tok-for-${state.lastTokenForm.get('code')}`,
@@ -91,7 +105,6 @@ async function startMockOAuthServer(): Promise<MockOAuthServer> {
     get lastTokenForm() { return state.lastTokenForm; },
     setNextCode(code) { state.nextCode = code; },
     setTokenResponse(body) { state.tokenResponse = body; },
-    setRegisterResponse(body) { state.registerResponse = body; },
     async shutdown() {
       await new Promise<void>((res) => server.close(() => res()));
     },
@@ -103,17 +116,6 @@ function simulatedBrowser(): (url: string) => Promise<void> {
     const response = await fetch(url, { redirect: 'manual' });
     const location = response.headers.get('location');
     if (location) await fetch(location);
-  };
-}
-
-function makeStored(overrides: Partial<StoredToken> = {}): StoredToken {
-  return {
-    serverURL: 'http://127.0.0.1:99999/mcp',
-    clientId: 'old',
-    accessToken: 'old-token',
-    expiresAt: null,
-    createdAt: new Date().toISOString(),
-    ...overrides,
   };
 }
 
@@ -133,7 +135,7 @@ describe('OAuthClient', () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
-  it('runs the full DCR + PKCE flow on first call, caches the token', async () => {
+  it('runs the full DCR + PKCE flow on first call and caches state', async () => {
     const client = new OAuthClient(new URL(`${mock.url}/mcp`), store, {
       openBrowser: simulatedBrowser(),
     });
@@ -144,15 +146,18 @@ describe('OAuthClient', () => {
 
     const cached = await store.load();
     expect(cached?.serverURL).toBe(`${mock.url}/mcp`);
-    expect(cached?.accessToken).toBe('tok-for-mock-code-1');
-    expect(cached?.clientId).toBe('mock-client-1');
-    expect(cached?.expiresAt).toBeNull(); // no expires_in in default response
+    expect(cached?.tokens?.access_token).toBe('tok-for-mock-code-1');
+    expect(cached?.clientInformation?.client_id).toBe('mock-client-1');
+
+    // PKCE: verifier sent to /token must be RFC 7636 unreserved-shape
+    // (alpha-num plus `-`, `.`, `_`, `~`).
+    const verifier = mock.lastTokenForm?.get('code_verifier') ?? '';
+    expect(verifier).toMatch(/^[A-Za-z0-9._~-]+$/);
+    expect(verifier.length).toBeGreaterThanOrEqual(43);
+
+    // 0600 file permissions.
     const stat = await fs.stat(store.path);
     expect(stat.mode & 0o777).toBe(0o600);
-
-    const verifier = mock.lastTokenForm?.get('code_verifier') ?? '';
-    expect(verifier).toMatch(/^[A-Za-z0-9_-]+$/);
-    expect(verifier.length).toBeGreaterThanOrEqual(43);
   });
 
   it('reuses the cached token on subsequent calls — no second OAuth round-trip', async () => {
@@ -168,8 +173,14 @@ describe('OAuthClient', () => {
     expect(mock.tokenCalls).toBe(1);
   });
 
-  it('ignores a cached token that was issued for a different server URL', async () => {
-    await store.save(makeStored());
+  it('drops a cached state that was issued for a different server URL', async () => {
+    const stale: CachedOAuthState = {
+      serverURL: 'http://127.0.0.1:99999/mcp',
+      clientInformation: { client_id: 'old', redirect_uris: ['http://127.0.0.1:0/cb'] },
+      tokens: { access_token: 'old-token', token_type: 'Bearer' },
+    };
+    await store.save(stale);
+
     const client = new OAuthClient(new URL(`${mock.url}/mcp`), store, {
       openBrowser: simulatedBrowser(),
     });
@@ -195,7 +206,6 @@ describe('OAuthClient', () => {
   it('throws when the OAuth provider returns an error in the callback', async () => {
     const client = new OAuthClient(new URL(`${mock.url}/mcp`), store, {
       openBrowser: async (authUrlStr) => {
-        // Skip /authorize entirely — hit the callback directly with `error`.
         const authURL = new URL(authUrlStr);
         const redirectUri = authURL.searchParams.get('redirect_uri')!;
         const stateParam = authURL.searchParams.get('state') ?? '';
@@ -207,66 +217,25 @@ describe('OAuthClient', () => {
       },
     });
     await expect(client.accessToken()).rejects.toThrow(/access_denied/);
-    expect(await store.load()).toBeNull();
+    // Cache may have partial state (DCR'd client + verifier); the access token
+    // itself never landed, so the next attempt will re-auth.
+    expect((await store.load())?.tokens).toBeUndefined();
   });
 
-  it('persists expires_in from the token response as an absolute expiresAt', async () => {
-    mock.setTokenResponse({ access_token: 'tok', expires_in: 3600, token_type: 'Bearer' });
-    const fixedNow = new Date('2026-05-26T12:00:00Z');
+  it('persists refresh_token from the token response', async () => {
+    mock.setTokenResponse({
+      access_token: 'tok',
+      token_type: 'Bearer',
+      refresh_token: 'rt-1',
+      expires_in: 3600,
+    });
     const client = new OAuthClient(new URL(`${mock.url}/mcp`), store, {
       openBrowser: simulatedBrowser(),
-      now: () => fixedNow,
     });
     await client.accessToken();
     const cached = await store.load();
-    expect(cached?.expiresAt).toBe('2026-05-26T13:00:00.000Z');
-  });
-
-  it('treats an expired cached token as absent and re-runs OAuth', async () => {
-    let now = new Date('2026-05-26T12:00:00Z');
-    const client = new OAuthClient(new URL(`${mock.url}/mcp`), store, {
-      openBrowser: simulatedBrowser(),
-      now: () => now,
-    });
-    mock.setTokenResponse({ access_token: 'first', expires_in: 3600, token_type: 'Bearer' });
-    const first = await client.accessToken();
-    expect(first).toBe('first');
-
-    // Advance past expiry (with the 30s skew).
-    now = new Date('2026-05-26T14:00:00Z');
-    mock.setTokenResponse({ access_token: 'second', expires_in: 3600, token_type: 'Bearer' });
-    const second = await client.accessToken();
-    expect(second).toBe('second');
-    expect(mock.tokenCalls).toBe(2);
-  });
-
-  it('still uses an unexpired cached token', async () => {
-    let now = new Date('2026-05-26T12:00:00Z');
-    const client = new OAuthClient(new URL(`${mock.url}/mcp`), store, {
-      openBrowser: simulatedBrowser(),
-      now: () => now,
-    });
-    mock.setTokenResponse({ access_token: 'fresh', expires_in: 3600, token_type: 'Bearer' });
-    await client.accessToken();
-    now = new Date('2026-05-26T12:30:00Z'); // 30 min in, well within expiry
-    expect(await client.accessToken()).toBe('fresh');
-    expect(mock.tokenCalls).toBe(1);
-  });
-
-  it('throws when DCR returns 200 with no client_id', async () => {
-    mock.setRegisterResponse({});
-    const client = new OAuthClient(new URL(`${mock.url}/mcp`), store, {
-      openBrowser: simulatedBrowser(),
-    });
-    await expect(client.accessToken()).rejects.toThrow(/client_id/);
-  });
-
-  it('throws when /token returns 200 with no access_token', async () => {
-    mock.setTokenResponse({});
-    const client = new OAuthClient(new URL(`${mock.url}/mcp`), store, {
-      openBrowser: simulatedBrowser(),
-    });
-    await expect(client.accessToken()).rejects.toThrow(/access_token/);
+    expect(cached?.tokens?.refresh_token).toBe('rt-1');
+    expect(cached?.tokens?.expires_in).toBe(3600);
   });
 });
 

@@ -1,34 +1,26 @@
-// OAuth client for Paste's loopback MCP server. Implements the canonical MCP
-// authorization dance: RFC 9728 protected-resource metadata → RFC 8414 auth
-// server metadata → RFC 7591 dynamic client registration → authorization code
-// + PKCE → token exchange. Tokens cached on disk between invocations.
+// OAuth client for Paste's loopback MCP server, built on the official
+// `@modelcontextprotocol/sdk` `auth()` function. The SDK handles metadata
+// discovery (RFC 9728 protected-resource + RFC 8414 + OIDC fallback),
+// dynamic client registration (RFC 7591), PKCE generation/verification,
+// the `resource` indicator (RFC 8707), `iss` validation (RFC 9207), token
+// exchange, and refresh-token rotation. We provide the storage backing
+// and the side effects (open browser, wait on the loopback callback).
 
 import { spawn } from 'node:child_process';
+import {
+  auth,
+  type OAuthClientProvider,
+} from '@modelcontextprotocol/sdk/client/auth.js';
+import type {
+  OAuthClientInformationFull,
+  OAuthClientInformationMixed,
+  OAuthClientMetadata,
+  OAuthTokens,
+} from '@modelcontextprotocol/sdk/shared/auth.js';
 import { startCallbackServer, type CallbackServer } from './callback.js';
-import { generatePKCE } from './pkce.js';
-import { TokenStore, type StoredToken } from './store.js';
-
-interface AuthServerMetadata {
-  authorization_endpoint: string;
-  token_endpoint: string;
-  registration_endpoint: string;
-}
-
-interface ResourceMetadata {
-  authorization_servers?: string[];
-}
-
-interface RegistrationResponse {
-  client_id: string;
-}
-
-interface TokenResponse {
-  access_token: string;
-  expires_in?: number;
-}
+import { TokenStore } from './store.js';
 
 const CLIENT_NAME = 'Paste MCP Bridge';
-const TOKEN_ERROR_BODY_CAP = 500;
 
 export type StartCallbackServer = () => Promise<CallbackServer>;
 export type OpenBrowser = (url: string) => void | Promise<void>;
@@ -37,14 +29,12 @@ export interface OAuthClientOptions {
   fetch?: typeof fetch;
   openBrowser?: OpenBrowser;
   startCallbackServer?: StartCallbackServer;
-  now?: () => Date;
 }
 
 export class OAuthClient {
   private readonly fetchImpl: typeof fetch;
   private readonly openBrowserImpl: OpenBrowser;
   private readonly startCallbackServerImpl: StartCallbackServer;
-  private readonly nowImpl: () => Date;
 
   constructor(
     public readonly serverURL: URL,
@@ -54,183 +44,154 @@ export class OAuthClient {
     this.fetchImpl = opts.fetch ?? fetch;
     this.openBrowserImpl = opts.openBrowser ?? defaultOpenBrowser;
     this.startCallbackServerImpl = opts.startCallbackServer ?? startCallbackServer;
-    this.nowImpl = opts.now ?? (() => new Date());
   }
 
   async accessToken(): Promise<string> {
     const cached = await this.store.load();
-    if (cached && cached.accessToken && cached.serverURL === this.serverURL.toString() && !this.isExpired(cached)) {
-      return cached.accessToken;
+    if (cached && cached.serverURL === this.serverURL.toString() && cached.tokens?.access_token) {
+      // Short-circuit: Paste issues long-lived access tokens without
+      // refresh_tokens, so SDK's `auth()` would always fall through to a
+      // fresh authorization. The bridge's transport will call `invalidate()`
+      // on 401 if the token actually went stale.
+      return cached.tokens.access_token;
     }
-    return await this.runFlow();
-  }
-
-  async invalidate(): Promise<void> {
-    await this.store.clear();
-  }
-
-  private isExpired(token: StoredToken): boolean {
-    if (token.expiresAt === null) return false;
-    const expiresAt = Date.parse(token.expiresAt);
-    if (!Number.isFinite(expiresAt)) return false;
-    // 30-second skew so we don't hand out a token that's about to die in flight.
-    return expiresAt <= this.nowImpl().getTime() + 30_000;
-  }
-
-  private async runFlow(): Promise<string> {
-    const metadata = await discoverAuthServer(this.serverURL, this.fetchImpl);
+    // Different server URL (port changed, channel switched) → drop the cache.
+    if (cached && cached.serverURL !== this.serverURL.toString()) {
+      await this.store.clear();
+    }
     const callback = await this.startCallbackServerImpl();
-    const redirectUri = `http://127.0.0.1:${callback.port}/cb`;
+    const provider = new BridgeProvider({
+      serverURL: this.serverURL.toString(),
+      redirectUrl: `http://127.0.0.1:${callback.port}/cb`,
+      state: callback.state,
+      store: this.store,
+      openBrowser: this.openBrowserImpl,
+    });
     try {
-      const clientId = await registerClient(metadata, redirectUri, this.fetchImpl);
-      const { accessToken, expiresIn } = await this.authorize(metadata, clientId, redirectUri, callback);
-      const expiresAt = expiresIn != null
-        ? new Date(this.nowImpl().getTime() + expiresIn * 1_000).toISOString()
-        : null;
-      const stored: StoredToken = {
-        serverURL: this.serverURL.toString(),
-        clientId,
-        accessToken,
-        expiresAt,
-        createdAt: this.nowImpl().toISOString(),
-      };
-      await this.store.save(stored);
-      return accessToken;
+      const first = await auth(provider, {
+        serverUrl: this.serverURL,
+        fetchFn: this.fetchImpl,
+      });
+      if (first === 'AUTHORIZED') return await readToken(provider);
+
+      const cb = await callback.waitForCallback();
+      if (cb.error) {
+        const detail = cb.errorDescription ? ` — ${cb.errorDescription}` : '';
+        throw new Error(`OAuth error: ${cb.error}${detail}`);
+      }
+      if (!cb.code) throw new Error('OAuth callback missing `code`');
+
+      const second = await auth(provider, {
+        serverUrl: this.serverURL,
+        authorizationCode: cb.code,
+        fetchFn: this.fetchImpl,
+      });
+      if (second !== 'AUTHORIZED') {
+        throw new Error(`OAuth handshake did not authorize (returned ${second})`);
+      }
+      return await readToken(provider);
     } finally {
       await callback.shutdown();
     }
   }
 
-  private async authorize(
-    metadata: AuthServerMetadata,
-    clientId: string,
-    redirectUri: string,
-    callback: CallbackServer,
-  ): Promise<{ accessToken: string; expiresIn?: number }> {
-    const pkce = generatePKCE();
-    await this.openBrowserImpl(buildAuthURL(metadata, clientId, redirectUri, pkce.challenge, callback.state));
-
-    const result = await callback.waitForCallback();
-    if (result.error) {
-      const detail = result.errorDescription ? ` — ${result.errorDescription}` : '';
-      throw new Error(`OAuth error: ${result.error}${detail}`);
-    }
-    if (!result.code) throw new Error('OAuth callback missing `code`');
-    // Belt-and-braces: CallbackServer enforces state too, but a mismatch here
-    // means the callback contract drifted — fail loud rather than proceed.
-    if (result.state !== callback.state) throw new Error('OAuth state mismatch');
-
-    return await exchangeCode(metadata, clientId, result.code, redirectUri, pkce.verifier, this.fetchImpl);
+  async invalidate(): Promise<void> {
+    await this.store.clear();
   }
 }
 
-async function discoverAuthServer(serverURL: URL, fetchImpl: typeof fetch): Promise<AuthServerMetadata> {
-  const origin = serverURL.origin;
-  let authBase = origin;
-  try {
-    const meta = await fetchJSON<ResourceMetadata>(
-      `${origin}/.well-known/oauth-protected-resource`,
-      fetchImpl,
-    );
-    const first = meta.authorization_servers?.[0];
-    if (first) authBase = first.replace(/\/$/, '');
-  } catch {
-    // Resource metadata is optional per the spec — fall back to assuming the
-    // server is its own authorization server (Paste's setup).
-  }
-  const metadata = await fetchJSON<AuthServerMetadata>(
-    `${authBase}/.well-known/oauth-authorization-server`,
-    fetchImpl,
-  );
-  if (
-    typeof metadata.authorization_endpoint !== 'string'
-    || typeof metadata.token_endpoint !== 'string'
-    || typeof metadata.registration_endpoint !== 'string'
-  ) {
-    throw new Error('Authorization server metadata is missing required endpoints');
-  }
-  return metadata;
+async function readToken(provider: OAuthClientProvider): Promise<string> {
+  const tokens = await provider.tokens();
+  if (!tokens?.access_token) throw new Error('OAuth flow completed but no access token was returned');
+  return tokens.access_token;
 }
 
-async function registerClient(
-  metadata: AuthServerMetadata,
-  redirectUri: string,
-  fetchImpl: typeof fetch,
-): Promise<string> {
-  const response = await fetchImpl(metadata.registration_endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-    body: JSON.stringify({
+interface BridgeProviderOptions {
+  serverURL: string;
+  redirectUrl: string;
+  state: string;
+  store: TokenStore;
+  openBrowser: OpenBrowser;
+}
+
+class BridgeProvider implements OAuthClientProvider {
+  constructor(private readonly opts: BridgeProviderOptions) {}
+
+  get redirectUrl(): string {
+    return this.opts.redirectUrl;
+  }
+
+  get clientMetadata(): OAuthClientMetadata {
+    return {
       client_name: CLIENT_NAME,
-      redirect_uris: [redirectUri],
+      redirect_uris: [this.opts.redirectUrl],
       token_endpoint_auth_method: 'none',
-      grant_types: ['authorization_code'],
+      grant_types: ['authorization_code', 'refresh_token'],
       response_types: ['code'],
-    }),
-  });
-  if (!response.ok) {
-    throw new Error(`Dynamic client registration failed: HTTP ${response.status}`);
+    };
   }
-  const data = (await response.json()) as RegistrationResponse;
-  if (typeof data.client_id !== 'string' || data.client_id.length === 0) {
-    throw new Error('Dynamic client registration response missing `client_id`');
-  }
-  return data.client_id;
-}
 
-async function exchangeCode(
-  metadata: AuthServerMetadata,
-  clientId: string,
-  code: string,
-  redirectUri: string,
-  verifier: string,
-  fetchImpl: typeof fetch,
-): Promise<{ accessToken: string; expiresIn?: number }> {
-  const body = new URLSearchParams({
-    grant_type: 'authorization_code',
-    code,
-    redirect_uri: redirectUri,
-    client_id: clientId,
-    code_verifier: verifier,
-  }).toString();
-  const response = await fetchImpl(metadata.token_endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
-    body,
-  });
-  if (!response.ok) {
-    // Capping the error body keeps verifier/code material out of stderr if
-    // the AS ever echoes them back in a regression.
-    const detail = (await response.text()).slice(0, TOKEN_ERROR_BODY_CAP);
-    throw new Error(`Token exchange failed: HTTP ${response.status}: ${detail}`);
+  // Per-flow state for CSRF defense. Our callback server validates this on
+  // its side too — defense in depth.
+  state(): string {
+    return this.opts.state;
   }
-  const data = (await response.json()) as TokenResponse;
-  if (typeof data.access_token !== 'string' || data.access_token.length === 0) {
-    throw new Error('Token response missing `access_token`');
-  }
-  return {
-    accessToken: data.access_token,
-    ...(typeof data.expires_in === 'number' && data.expires_in > 0
-      ? { expiresIn: data.expires_in }
-      : {}),
-  };
-}
 
-function buildAuthURL(
-  metadata: AuthServerMetadata,
-  clientId: string,
-  redirectUri: string,
-  challenge: string,
-  state: string,
-): string {
-  const url = new URL(metadata.authorization_endpoint);
-  url.searchParams.set('response_type', 'code');
-  url.searchParams.set('client_id', clientId);
-  url.searchParams.set('redirect_uri', redirectUri);
-  url.searchParams.set('code_challenge', challenge);
-  url.searchParams.set('code_challenge_method', 'S256');
-  url.searchParams.set('state', state);
-  return url.toString();
+  async clientInformation(): Promise<OAuthClientInformationMixed | undefined> {
+    return (await this.loadCache()).clientInformation;
+  }
+
+  async saveClientInformation(info: OAuthClientInformationFull): Promise<void> {
+    await this.mergeCache({ clientInformation: info });
+  }
+
+  async tokens(): Promise<OAuthTokens | undefined> {
+    return (await this.loadCache()).tokens;
+  }
+
+  async saveTokens(tokens: OAuthTokens): Promise<void> {
+    await this.mergeCache({ tokens });
+  }
+
+  async saveCodeVerifier(verifier: string): Promise<void> {
+    await this.mergeCache({ codeVerifier: verifier });
+  }
+
+  async codeVerifier(): Promise<string> {
+    const cached = await this.loadCache();
+    if (!cached.codeVerifier) {
+      throw new Error('No PKCE code verifier in cache — OAuth state was cleared between auth() calls');
+    }
+    return cached.codeVerifier;
+  }
+
+  async redirectToAuthorization(authorizationUrl: URL): Promise<void> {
+    await this.opts.openBrowser(authorizationUrl.toString());
+  }
+
+  async invalidateCredentials(scope: 'all' | 'client' | 'tokens' | 'verifier' | 'discovery'): Promise<void> {
+    if (scope === 'all') {
+      await this.opts.store.clear();
+      return;
+    }
+    const cached = await this.opts.store.load();
+    if (!cached) return;
+    const next = { ...cached };
+    if (scope === 'client') delete next.clientInformation;
+    if (scope === 'tokens') delete next.tokens;
+    if (scope === 'verifier') delete next.codeVerifier;
+    // 'discovery' — we don't cache discovery state, nothing to do.
+    await this.opts.store.save(next);
+  }
+
+  private async loadCache() {
+    return (await this.opts.store.load()) ?? { serverURL: this.opts.serverURL };
+  }
+
+  private async mergeCache(patch: Partial<Awaited<ReturnType<TokenStore['load']>> & object>): Promise<void> {
+    const cached = await this.loadCache();
+    await this.opts.store.save({ ...cached, ...patch, serverURL: this.opts.serverURL });
+  }
 }
 
 // Refuse to launch anything but an HTTP(S) URL pointing at loopback. An
@@ -256,10 +217,4 @@ function defaultOpenBrowser(url: string): void {
   // OAuth flow surfaces "callback timed out" instead.
   child.on('error', () => { /* swallow */ });
   child.unref();
-}
-
-async function fetchJSON<T>(url: string, fetchImpl: typeof fetch, init?: RequestInit): Promise<T> {
-  const response = await fetchImpl(url, init);
-  if (!response.ok) throw new Error(`HTTP ${response.status} fetching ${url}`);
-  return (await response.json()) as T;
 }
