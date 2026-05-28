@@ -1,0 +1,58 @@
+{
+  "name": "@pasteapp/mcp",
+  "version": "0.1.0",
+  "description": "Local MCP server bridge for Paste — give Claude Desktop, Claude Code, Cursor, Codex, and other AI tools access to your Mac clipboard history and pinboards.",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "claude",
+    "claude-desktop",
+    "claude-code",
+    "cursor",
+    "codex",
+    "openai-codex",
+    "clipboard",
+    "paste",
+    "macos",
+    "mac",
+    "ai-tools",
+    "local-mcp",
+    "stdio"
+  ],
+  "homepage": "https://pasteapp.io",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pasteapp/paste-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pasteapp/paste-mcp/issues"
+  },
+  "license": "MIT",
+  "author": "Paste Team ApS (https://pasteapp.io)",
+  "type": "module",
+  "bin": {
+    "paste-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc && chmod +x dist/index.js",
+    "test": "vitest run",
+    "dev": "tsx src/index.ts",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}
