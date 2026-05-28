@@ -16,10 +16,9 @@ import type {
   OAuthClientMetadata,
   OAuthTokens,
 } from '@modelcontextprotocol/sdk/shared/auth.js';
+import { detectClientName } from '../client-name.js';
 import { startCallbackServer, type CallbackServer } from './callback.js';
 import { TokenStore, type CachedOAuthState } from './store.js';
-
-const CLIENT_NAME = 'Paste MCP Bridge';
 
 export type StartCallbackServer = () => Promise<CallbackServer>;
 export type OpenBrowser = (url: string) => void | Promise<void>;
@@ -28,6 +27,9 @@ export interface OAuthClientOptions {
   fetch?: typeof fetch;
   openBrowser?: OpenBrowser;
   startCallbackServer?: StartCallbackServer;
+  /// Override the auto-detected AI tool name sent at DCR. Default: env
+  /// `PASTE_MCP_CLIENT` → process-tree heuristic → `@pasteapp/mcp`.
+  clientName?: string | (() => string | Promise<string>);
 }
 
 export class OAuthClient {
@@ -38,7 +40,7 @@ export class OAuthClient {
   constructor(
     public readonly serverURL: URL,
     private readonly store: TokenStore = new TokenStore(),
-    opts: OAuthClientOptions = {},
+    private readonly opts: OAuthClientOptions = {},
   ) {
     this.fetchImpl = opts.fetch ?? fetch;
     this.openBrowserImpl = opts.openBrowser ?? defaultOpenBrowser;
@@ -65,6 +67,7 @@ export class OAuthClient {
       state: callback.state,
       store: this.store,
       openBrowser: this.openBrowserImpl,
+      clientName: await this.resolveClientName(),
     });
     try {
       const first = await auth(provider, {
@@ -97,6 +100,13 @@ export class OAuthClient {
   async invalidate(): Promise<void> {
     await this.store.clear();
   }
+
+  private async resolveClientName(): Promise<string> {
+    const override = this.opts.clientName;
+    if (typeof override === 'string') return override;
+    if (typeof override === 'function') return await override();
+    return await detectClientName();
+  }
 }
 
 async function readToken(provider: OAuthClientProvider): Promise<string> {
@@ -111,6 +121,7 @@ interface BridgeProviderOptions {
   state: string;
   store: TokenStore;
   openBrowser: OpenBrowser;
+  clientName: string;
 }
 
 class BridgeProvider implements OAuthClientProvider {
@@ -122,7 +133,7 @@ class BridgeProvider implements OAuthClientProvider {
 
   get clientMetadata(): OAuthClientMetadata {
     return {
-      client_name: CLIENT_NAME,
+      client_name: this.opts.clientName,
       redirect_uris: [this.opts.redirectUrl],
       token_endpoint_auth_method: 'none',
       grant_types: ['authorization_code', 'refresh_token'],
