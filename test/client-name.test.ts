@@ -7,26 +7,8 @@ function chain(...steps: ProcessInfo[]): (pid: number) => Promise<ProcessInfo | 
 }
 
 describe('detectClientName', () => {
-  it('returns PASTE_MCP_CLIENT when set in the env', async () => {
-    const name = await detectClientName({
-      env: { PASTE_MCP_CLIENT: 'Codex' },
-      readProcessArgs: async () => null,
-    });
-    expect(name).toBe('Codex');
-  });
-
-  it('ignores empty env override and walks the process tree', async () => {
-    const name = await detectClientName({
-      env: { PASTE_MCP_CLIENT: '' },
-      startPid: 100,
-      readProcessArgs: chain({ ppid: 0, args: '/Applications/Claude.app/Contents/MacOS/Claude' }),
-    });
-    expect(name).toBe('Claude Desktop');
-  });
-
   it('recognizes Claude Desktop', async () => {
     expect(await detectClientName({
-      env: {},
       startPid: 1,
       readProcessArgs: chain({ ppid: 0, args: '/Applications/Claude.app/Contents/MacOS/Claude' }),
     })).toBe('Claude Desktop');
@@ -34,7 +16,6 @@ describe('detectClientName', () => {
 
   it('recognizes Claude Code by walking past npx + node wrappers', async () => {
     expect(await detectClientName({
-      env: {},
       startPid: 1,
       readProcessArgs: chain(
         { ppid: 2, args: 'npx -y @pasteapp/mcp' },
@@ -45,7 +26,6 @@ describe('detectClientName', () => {
 
   it('recognizes Cursor', async () => {
     expect(await detectClientName({
-      env: {},
       startPid: 1,
       readProcessArgs: chain({ ppid: 0, args: '/Applications/Cursor.app/Contents/MacOS/Cursor --type=renderer' }),
     })).toBe('Cursor');
@@ -53,7 +33,6 @@ describe('detectClientName', () => {
 
   it('recognizes Codex by argv', async () => {
     expect(await detectClientName({
-      env: {},
       startPid: 1,
       readProcessArgs: chain(
         { ppid: 2, args: 'npx -y @pasteapp/mcp' },
@@ -64,7 +43,6 @@ describe('detectClientName', () => {
 
   it('recognizes Windsurf', async () => {
     expect(await detectClientName({
-      env: {},
       startPid: 1,
       readProcessArgs: chain({ ppid: 0, args: '/Applications/Windsurf.app/Contents/MacOS/Windsurf' }),
     })).toBe('Windsurf');
@@ -72,7 +50,6 @@ describe('detectClientName', () => {
 
   it('recognizes VS Code', async () => {
     expect(await detectClientName({
-      env: {},
       startPid: 1,
       readProcessArgs: chain({ ppid: 0, args: '/Applications/Visual Studio Code.app/Contents/MacOS/Electron' }),
     })).toBe('VS Code');
@@ -80,7 +57,6 @@ describe('detectClientName', () => {
 
   it('falls back to the package slug when nothing in the tree matches', async () => {
     expect(await detectClientName({
-      env: {},
       startPid: 1,
       readProcessArgs: chain(
         { ppid: 2, args: 'npx -y @pasteapp/mcp' },
@@ -93,7 +69,6 @@ describe('detectClientName', () => {
 
   it('stops walking past an unknown non-wrapper process', async () => {
     expect(await detectClientName({
-      env: {},
       startPid: 1,
       readProcessArgs: chain(
         { ppid: 2, args: 'npx -y @pasteapp/mcp' },
@@ -107,7 +82,6 @@ describe('detectClientName', () => {
 
   it('falls back when ps returns null at every step', async () => {
     expect(await detectClientName({
-      env: {},
       startPid: 1,
       readProcessArgs: async () => null,
     })).toBe('@pasteapp/mcp');

@@ -1,11 +1,8 @@
 // Identify which AI tool spawned the bridge so Paste's `Client.Kind.inferred`
-// can pick the right icon and label in the MCP & AI Tools list. Three layers:
-//
-//   1. PASTE_MCP_CLIENT env var — set by Paste's "Connect AI Tool" button or
-//      add-mcp invocations that know the target client up front.
-//   2. Process-tree walk — find the first ancestor whose argv mentions a
-//      known AI tool, skipping shells/node/npx wrappers along the way.
-//   3. Fallback to the npm package slug.
+// can pick the right icon and label in the MCP & AI Tools list. Walks the
+// parent-process tree via `ps`, stepping past shell/node/npx wrappers, and
+// matches the first ancestor whose argv mentions a known AI tool. Falls back
+// to the npm package slug when nothing matches.
 //
 // The returned name MUST contain a substring that Paste's Swift
 // `Client.Kind.inferred(fromClientName:)` recognizes — "claude code",
@@ -18,7 +15,6 @@ import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 
 const DEFAULT_NAME = '@pasteapp/mcp';
-const ENV_VAR = 'PASTE_MCP_CLIENT';
 
 // More specific first — `Claude Code` must be tested before `Claude Desktop`
 // because the Code CLI's argv also contains the substring "claude".
@@ -45,7 +41,6 @@ export interface ProcessInfo {
 }
 
 export interface DetectOptions {
-  env?: NodeJS.ProcessEnv;
   startPid?: number;
   readProcessArgs?: (pid: number) => Promise<ProcessInfo | null>;
 }
@@ -77,10 +72,6 @@ function isWrapper(args: string): boolean {
 }
 
 export async function detectClientName(opts: DetectOptions = {}): Promise<string> {
-  const env = opts.env ?? process.env;
-  const override = env[ENV_VAR];
-  if (override && override.length > 0) return override;
-
   const read = opts.readProcessArgs ?? defaultReadProcessArgs;
   let pid = opts.startPid ?? process.ppid;
   for (let i = 0; i < 8; i++) {

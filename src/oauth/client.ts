@@ -27,8 +27,8 @@ export interface OAuthClientOptions {
   fetch?: typeof fetch;
   openBrowser?: OpenBrowser;
   startCallbackServer?: StartCallbackServer;
-  /// Override the auto-detected AI tool name sent at DCR. Default: env
-  /// `PASTE_MCP_CLIENT` → process-tree heuristic → `@pasteapp/mcp`.
+  /// Override the auto-detected AI tool name sent at DCR. Default: a
+  /// process-tree heuristic that falls back to the `@pasteapp/mcp` slug.
   clientName?: string | (() => string | Promise<string>);
 }
 
