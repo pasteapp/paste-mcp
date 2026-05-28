@@ -7,7 +7,9 @@
 // The returned name MUST contain a substring that Paste's Swift
 // `Client.Kind.inferred(fromClientName:)` recognizes — "claude code",
 // "claude", "cursor", "codex", "windsurf", "vscode"/"vs code" — otherwise
-// the client lands as `.custom` with the bare package slug.
+// the client lands as `.custom` with the slug below as its display name.
+// (OpenCode is detected here so it shows up labeled, but Paste still maps
+// it to `.custom` until the Swift side gains a case for it.)
 
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -25,6 +27,7 @@ const CLIENT_PATTERNS: ReadonlyArray<{ pattern: RegExp; name: string }> = [
   { pattern: /Windsurf\.app\b/i, name: 'Windsurf' },
   { pattern: /Visual Studio Code\.app\b|\/Code\.app\b/i, name: 'VS Code' },
   { pattern: /@openai\/codex|\bcodex\b/i, name: 'Codex' },
+  { pattern: /\bopencode\b/i, name: 'OpenCode' },
 ];
 
 // Processes we step past when walking up — they're shell/runtime wrappers,

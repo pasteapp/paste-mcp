@@ -31,6 +31,13 @@ describe('detectClientName', () => {
     })).toBe('Cursor');
   });
 
+  it('recognizes OpenCode by argv', async () => {
+    expect(await detectClientName({
+      startPid: 1,
+      readProcessArgs: chain({ ppid: 0, args: '/opt/homebrew/bin/opencode --tui' }),
+    })).toBe('OpenCode');
+  });
+
   it('recognizes Codex by argv', async () => {
     expect(await detectClientName({
       startPid: 1,
