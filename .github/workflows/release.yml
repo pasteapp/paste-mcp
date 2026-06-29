@@ -24,3 +24,22 @@ jobs:
       - run: npm run build
       - run: npm test
       - run: npm publish --provenance --access public
+
+      # Publish the listing to the official MCP Registry
+      # (registry.modelcontextprotocol.io) under the io.pasteapp/paste namespace.
+      # Auth is domain-based: the registry verifies the Ed25519 key served at
+      # https://pasteapp.io/.well-known/mcp-registry-auth against a signature
+      # made with MCP_REGISTRY_PRIVATE_KEY. The well-known file must be live
+      # before this runs. The npm step above must have published this version,
+      # which carries the matching `mcpName` for package validation.
+      - name: Sync server.json version to package.json
+        run: |
+          VERSION="$(jq -r .version package.json)"
+          jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.tmp
+          mv server.tmp server.json
+      - name: Install mcp-publisher
+        run: curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+      - name: Authenticate to the MCP Registry (pasteapp.io domain auth)
+        run: ./mcp-publisher login http --domain pasteapp.io --private-key "${{ secrets.MCP_REGISTRY_PRIVATE_KEY }}"
+      - name: Publish server to the MCP Registry
+        run: ./mcp-publisher publish
