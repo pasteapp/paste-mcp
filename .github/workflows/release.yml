@@ -5,7 +5,7 @@ on:
     types: [published]
 
 permissions:
-  contents: read
+  contents: write # attach the built .mcpb bundle to the release
   id-token: write # required for npm provenance via OIDC trusted publishing
 
 jobs:
@@ -32,14 +32,25 @@ jobs:
       # made with MCP_REGISTRY_PRIVATE_KEY. The well-known file must be live
       # before this runs. The npm step above must have published this version,
       # which carries the matching `mcpName` for package validation.
-      - name: Sync server.json version to package.json
+      - name: Sync server.json + manifest.json version to package.json
         run: |
           VERSION="$(jq -r .version package.json)"
           jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' server.json > server.tmp
           mv server.tmp server.json
+          jq --arg v "$VERSION" '.version = $v' manifest.json > manifest.tmp
+          mv manifest.tmp manifest.json
       - name: Install mcp-publisher
         run: curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
       - name: Authenticate to the MCP Registry (pasteapp.io domain auth)
         run: ./mcp-publisher login http --domain pasteapp.io --private-key "${{ secrets.MCP_REGISTRY_PRIVATE_KEY }}"
       - name: Publish server to the MCP Registry
         run: ./mcp-publisher publish
+
+      # Build the Claude Desktop bundle (.mcpb) and attach it to the GitHub
+      # release so the directory listing always tracks the published version.
+      - name: Build .mcpb bundle
+        run: bash scripts/build-mcpb.sh
+      - name: Attach .mcpb to the release
+        run: gh release upload "${{ github.event.release.tag_name }}" paste.mcpb --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}

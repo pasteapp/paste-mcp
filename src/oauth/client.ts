@@ -56,10 +56,10 @@ export class OAuthClient {
       // on 401 if the token actually went stale.
       return cached.tokens.access_token;
     }
-    // Different server URL (port changed, channel switched) → drop the cache.
-    if (cached && cached.serverURL !== this.serverURL.toString()) {
-      await this.store.clear();
-    }
+    // Drop stale state before a fresh flow: a client registration from an
+    // aborted attempt is bound to its old callback port and would fail this
+    // flow's redirect_uri (`invalid_redirect_uri`).
+    await this.store.clear();
     const callback = await this.startCallbackServerImpl();
     const provider = new BridgeProvider({
       serverURL: this.serverURL.toString(),
