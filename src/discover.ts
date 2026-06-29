@@ -45,18 +45,46 @@ function parsePort(raw: string): number | null {
 export interface DiscoverOptions {
   paths?: string[];
   read?: (plistPath: string, key: string) => Promise<string | null>;
+  probe?: (url: URL) => Promise<boolean>;
+}
+
+// Paste's default MCP port — fallback when the plist read is blocked (the App
+// Store build keeps the port in its sandbox container, unreadable without FDA).
+const DEFAULT_PORT = 39725;
+
+// A live endpoint answers (even a 401); only a refused/timed-out connection means nothing's listening.
+async function probeURL(url: URL): Promise<boolean> {
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{"jsonrpc":"2.0","id":0,"method":"ping"}',
+      signal: AbortSignal.timeout(800),
+    });
+    return response.status > 0;
+  } catch {
+    return false;
+  }
 }
 
 export async function discoverServerURL(opts: DiscoverOptions = {}): Promise<URL | null> {
   const paths = opts.paths ?? plistPaths();
   const read = opts.read ?? readDefault;
-  // Read both candidates in parallel — startup latency matters because each
-  // bridge spawn waits on this before serving anything.
+  const probe = opts.probe ?? probeURL;
+
+  // Plist port first (honors a custom port), then the default as a fallback.
+  const ports: number[] = [];
   const results = await Promise.allSettled(paths.map((path) => read(path, PORT_KEY)));
   for (const result of results) {
     if (result.status !== 'fulfilled' || result.value === null) continue;
     const port = parsePort(result.value);
-    if (port !== null) return new URL(`http://127.0.0.1:${port}/mcp`);
+    if (port !== null && !ports.includes(port)) ports.push(port);
+  }
+  if (!ports.includes(DEFAULT_PORT)) ports.push(DEFAULT_PORT);
+
+  for (const port of ports) {
+    const url = new URL(`http://127.0.0.1:${port}/mcp`);
+    if (await probe(url)) return url;
   }
   return null;
 }

@@ -46,9 +46,11 @@ You can also connect any app right inside Paste. Open **Settings → MCP & AI To
 
 ![Connecting an AI tool from Paste's MCP & AI Tools settings](assets/connect-ai-tools.png)
 
-## Privacy
+## Privacy Policy
 
-Paste MCP runs locally on your Mac. Your clipboard items only go to the AI apps you approve. You can revoke access anytime.
+Paste MCP runs locally on your Mac — it bridges your AI app to Paste's on-device server and sends nothing to Paste's own servers. Your clipboard items only reach the AI apps you approve, and you can revoke access anytime in **Settings → MCP & AI Tools**.
+
+Full policy — what data is processed, how it's stored, sharing, retention, and contact: **https://pasteapp.io/privacy**.
 
 ## Troubleshooting
 

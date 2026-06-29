@@ -215,6 +215,25 @@ describe('OAuthClient', () => {
     expect((await store.load())?.serverURL).toBe(`${mock.url}/mcp`);
   });
 
+  it('re-registers when a prior attempt left a client registration but no token (cancel → retry)', async () => {
+    // An aborted/cancelled flow persists a client registration bound to its old
+    // callback port, but no token. Reusing it would fail the new redirect_uri,
+    // so the next attempt must drop it and register afresh.
+    await store.save({
+      serverURL: `${mock.url}/mcp`,
+      clientInformation: { client_id: 'stale', redirect_uris: ['http://127.0.0.1:1/cb'] },
+    });
+
+    const client = new OAuthClient(new URL(`${mock.url}/mcp`), store, {
+      openBrowser: simulatedBrowser(),
+    });
+    const token = await client.accessToken();
+
+    expect(token).toBe('tok-for-mock-code-1');
+    expect(mock.registerCalls).toBe(1); // re-registered, did not reuse 'stale'
+    expect((await store.load())?.clientInformation?.client_id).toBe('mock-client-1');
+  });
+
 });
 
 describe('assertLoopbackHTTPURL', () => {

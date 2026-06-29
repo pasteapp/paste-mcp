@@ -5,6 +5,10 @@ node_modules/
 dist/
 *.tsbuildinfo
 
+# MCP bundle (built by scripts/build-mcpb.sh)
+*.mcpb
+.mcpb-build/
+
 # Logs
 *.log
 npm-debug.log*

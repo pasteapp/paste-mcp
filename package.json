@@ -1,6 +1,6 @@
 {
   "name": "@pasteapp/mcp",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "mcpName": "io.pasteapp/paste",
   "description": "Local MCP server bridge for Paste — give Claude Desktop, Claude Code, Cursor, Codex, and other AI tools access to your Mac clipboard history and pinboards.",
   "keywords": [
